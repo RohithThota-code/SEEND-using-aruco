@@ -18,7 +18,7 @@ import os
 import sys
 
 # =================== CONFIG ===================
-VIDEO_STREAM_URL = 0                       # 0 for USB cam; or RTSP/IP stream string
+VIDEO_STREAM_URL = '/dev/video0'                     # 0 for USB cam; or RTSP/IP stream string
 LIDAR_PORT = '/dev/ttyUSB0'
 PIXHAWK_PORT = '/dev/ttyACM1'
 DDSM_PORT = '/dev/ttyACM0'
