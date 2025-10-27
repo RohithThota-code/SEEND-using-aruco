@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Jetson Nano rover: GPS + LIDAR baseline + ArUco vision-guided local navigation.
+Combines your DDSM motor interface, Pixhawk DroneKit navigation and RPLidar scanning.
+"""
+
 from dronekit import connect, VehicleMode, LocationGlobalRelative
 from rplidar import RPLidar
 import math
@@ -9,313 +14,404 @@ import json
 import cv2
 import cv2.aruco as aruco
 import numpy as np
+import os
+import sys
 
-# =================== CONSTANTS ===================
-LIDAR_PORT = '/dev/ttyUSB0'     # Lidar port
-PIXHAWK_PORT = '/dev/ttyACM1'   # Pixhawk serial port
+# =================== CONFIG ===================
+VIDEO_STREAM_URL = 0                       # 0 for USB cam; or RTSP/IP stream string
+LIDAR_PORT = '/dev/ttyUSB0'
+PIXHAWK_PORT = '/dev/ttyACM1'
 DDSM_PORT = '/dev/ttyACM0'
 SERIAL_BAUDRATE = 115200
 BAUDRATE = 57600
-MIN_DISTANCE = 500              # mm obstacle threshold
-TARGET_LAT = 17.3973234         # Example GPS target
-TARGET_LON = 78.4899548
+
+MIN_DISTANCE = 500                         # mm, obstacle threshold for LIDAR
+WAYPOINT_REACHED_RADIUS = 1                # meters for GPS waypoint
 ALTITUDE = 0.0
-WAYPOINT_REACHED_RADIUS = 1
-FILE_NAME = "logged_coordinates.txt"
+
+# Motor speed tuning (adjust for your rover)
 TURN_SPEED = 30
 FORWARD_SPEED = 40
+SEARCH_TURN_SPEED = 20
+SEARCH_TIMEOUT = 8.0                       # seconds to scan for next tag
+DEAD_RECKON_FORWARD_SEC = 1.0              # fallback forward attempt (seconds)
+MAX_SEARCH_ATTEMPTS = 3
 
-# ---- Vision / ArUco parameters ----
-MARKER_LENGTH = 0.10  # meters
+# ArUco / camera
+MARKER_LENGTH = 0.10   # meters (actual printed marker side)
+# choose dictionary consistent with the markers you printed
 ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
 ARUCO_PARAMS = aruco.DetectorParameters_create()
-CAMERA_MATRIX = np.loadtxt("camera_matrix.txt")
-DIST_COEFFS = np.loadtxt("dist_coeffs.txt")
 
-# ---- Globals ----
-arrived = False
+# Attempt to load calibration (if present) else use approximate default
+CAMERA_MATRIX_FILE = "camera_matrix.txt"
+DIST_COEFFS_FILE = "dist_coeffs.txt"
+
+if os.path.exists(CAMERA_MATRIX_FILE) and os.path.exists(DIST_COEFFS_FILE):
+    CAMERA_MATRIX = np.loadtxt(CAMERA_MATRIX_FILE)
+    DIST_COEFFS = np.loadtxt(DIST_COEFFS_FILE)
+    print("[Vision] Camera calibration loaded.")
+else:
+    # Fallback / approximate intrinsics (tweak for your camera/resolution)
+    CAMERA_MATRIX = np.array([[800, 0, 320],
+                              [0, 800, 240],
+                              [0,   0,   1]], dtype=np.float32)
+    DIST_COEFFS = np.zeros((5, 1))
+    print("[Vision] Camera calibration files not found — using fallback intrinsics.")
+
+# Tag sequence you expect (IDs printed on your markers)
+TAG_SEQUENCE = [1, 2, 3]   # e.g., 1:ramp base, 2:ramp top, 3:door
+
+# =================== GLOBALS ===================
 latest_scan = None
 latest_servo1_value = None
 latest_servo3_value = None
-path = []
-latest_tag = None
+latest_tag = None            # {"id": int, "x":..., "y":..., "z":...}
 aruco_thread_running = True
+path = []                    # optional GPS waypoint list
 
-# ---- Serial motor controller ----
-ddsm_ser = serial.Serial(DDSM_PORT, baudrate=SERIAL_BAUDRATE)
-ddsm_ser.setRTS(False)
-ddsm_ser.setDTR(False)
-print("[System] DDSM Connected")
+# =================== HARDWARE SETUP ===================
+# DDSM serial
+try:
+    ddsm_ser = serial.Serial(DDSM_PORT, baudrate=SERIAL_BAUDRATE, timeout=0.2)
+    ddsm_ser.setRTS(False)
+    ddsm_ser.setDTR(False)
+    print(f"[System] DDSM connected on {DDSM_PORT}")
+except Exception as e:
+    print(f"[ERROR] opening DDSM port {DDSM_PORT}: {e}")
+    ddsm_ser = None
 
-# =================== FUNCTIONS ===================
+def motor_control(left, right):
+    """Send left/right commands to DDSM. left/right = integer speed values."""
+    global ddsm_ser
+    if ddsm_ser is None:
+        print(f"[Motor] Would send L={left} R={right} (no serial)")
+        return
+    cmd_r = {"T": 10010, "id": 2, "cmd": -int(right), "act": 3}
+    cmd_l = {"T": 10010, "id": 1, "cmd": int(left),  "act": 3}
+    try:
+        ddsm_ser.write((json.dumps(cmd_r) + '\n').encode())
+        time.sleep(0.01)
+        ddsm_ser.write((json.dumps(cmd_l) + '\n').encode())
+    except Exception as e:
+        print(f"[Motor] Serial write error: {e}")
 
+# =================== LIDAR THREAD ===================
+def lidar_thread_func(lidar):
+    global latest_scan
+    try:
+        for scan in lidar.iter_scans():
+            latest_scan = scan
+    except Exception as e:
+        print(f"[LIDAR] Exception in lidar thread: {e}")
+
+def is_front_clear():
+    """Return False if obstacle in frontal sector within MIN_DISTANCE (mm)."""
+    global latest_scan
+    if latest_scan is None:
+        return True
+    for (_, angle, dist) in latest_scan:
+        if (angle >= 340 or angle <= 20) and 0 < dist < MIN_DISTANCE:
+            return False
+    return True
+
+# =================== ARUCO VISION THREAD ===================
+def aruco_thread_func(vstream=VIDEO_STREAM_URL):
+    """Continuously read camera, detect ArUco and store nearest tag in latest_tag."""
+    global latest_tag, aruco_thread_running
+    cap = cv2.VideoCapture(vstream)
+    if not cap.isOpened():
+        print("[Vision] ERROR: camera not opened.")
+        aruco_thread_running = False
+        return
+    print("[Vision] Camera thread started.")
+    while aruco_thread_running:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.01)
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+        if ids is not None and len(ids) > 0:
+            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, MARKER_LENGTH, CAMERA_MATRIX, DIST_COEFFS)
+            distances = [np.linalg.norm(tvec[0]) for tvec in tvecs]
+            nearest_idx = int(np.argmin(distances))
+            latest_tag = {
+                "id": int(ids.flatten()[nearest_idx]),
+                "x": float(tvecs[nearest_idx][0][0]),
+                "y": float(tvecs[nearest_idx][0][1]),
+                "z": float(tvecs[nearest_idx][0][2])
+            }
+            # draw overlays
+            aruco.drawDetectedMarkers(frame, corners, ids)
+            aruco.drawAxis(frame, CAMERA_MATRIX, DIST_COEFFS, rvecs[nearest_idx], tvecs[nearest_idx], 0.05)
+        else:
+            latest_tag = None
+        cv2.imshow("Aruco", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            # user asked to exit vision window
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+    print("[Vision] Camera thread exiting.")
+
+# =================== VISION HELPERS ===================
+def vision_navigate_to_tag(target_id, align_thresh_x=0.05, stop_dist=0.4):
+    """
+    Move robot toward a *specific* target tag ID using latest_tag data.
+    Returns True when reached (z <= stop_dist).
+    When latest_tag is present but different ID, function will stop until target shows.
+    """
+    global latest_tag
+    if latest_tag is None:
+        motor_control(0, 0)
+        print("[Vision] No tag visible.")
+        return False
+    if latest_tag["id"] != target_id:
+        # we see some tag but it's not the one we want
+        motor_control(0, 0)
+        print(f"[Vision] Seen tag {latest_tag['id']}, waiting for target {target_id}.")
+        return False
+
+    x = latest_tag["x"]
+    z = latest_tag["z"]
+    print(f"[Vision] Target {target_id} seen: x={x:.3f} m, z={z:.3f} m")
+
+    # basic alignment controller
+    if abs(x) > align_thresh_x:
+        if x > 0:
+            motor_control(TURN_SPEED, -TURN_SPEED)   # turn right
+        else:
+            motor_control(-TURN_SPEED, TURN_SPEED)   # turn left
+        return False
+    # move forward if not too close and path is clear
+    if z > stop_dist:
+        if is_front_clear():
+            motor_control(FORWARD_SPEED, FORWARD_SPEED)
+        else:
+            print("[Vision] Obstacle ahead - stopping.")
+            motor_control(0, 0)
+        return False
+    # close enough
+    motor_control(0, 0)
+    print(f"[Vision] Reached target tag {target_id}.")
+    return True
+
+def search_for_next_tag(expected_id, timeout=SEARCH_TIMEOUT):
+    """
+    Rotate in place slowly searching for expected_id. Returns True if found.
+    Stops rotation when found or on timeout.
+    """
+    print(f"[Vision] Scanning for tag {expected_id} (timeout {timeout}s)...")
+    start = time.time()
+    while time.time() - start < timeout:
+        if latest_tag is not None and latest_tag["id"] == expected_id:
+            print(f"[Vision] Found tag {expected_id} during scan.")
+            motor_control(0, 0)
+            return True
+        # rotate in place slowly (right spin)
+        motor_control(SEARCH_TURN_SPEED, -SEARCH_TURN_SPEED)
+        time.sleep(0.15)
+    motor_control(0, 0)
+    print(f"[Vision] Scan timeout — tag {expected_id} not found.")
+    return False
+
+def dead_reckon_forward(seconds=DEAD_RECKON_FORWARD_SEC):
+    """Move forward a small, fixed time to attempt to reveal next tag; careful: used as fallback."""
+    print(f"[Vision] Dead-reckon forward for {seconds} s.")
+    start = time.time()
+    while time.time() - start < seconds:
+        if not is_front_clear():
+            print("[DeadReckon] Obstacle during dead-reckon, stopping.")
+            motor_control(0, 0)
+            return
+        motor_control(FORWARD_SPEED, FORWARD_SPEED)
+        time.sleep(0.05)
+    motor_control(0, 0)
+
+# =================== UTIL ===================
 def read_coordinates_from_file(filename):
     coords = []
     try:
         with open(filename, 'r') as f:
             for line in f:
-                line = line.strip().replace(" ", "")
-                if not line:
+                s = line.strip()
+                if not s:
                     continue
+                parts = s.replace(" ", "").split(',')
                 try:
-                    lat, lon = map(float, line.split(','))
+                    lat = float(parts[0]); lon = float(parts[1])
                     coords.append((lat, lon))
-                except ValueError:
-                    print(f"[System] Skipping invalid line: {line}")
+                except Exception:
+                    print(f"[System] Skipping invalid coordinate line: {s}")
     except FileNotFoundError:
-        print(f"[System] File not found: {filename}")
+        print(f"[System] Waypoint file not found: {filename}")
     return coords
-
 
 def get_haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371000
-    phi1, phi2 = map(math.radians, [lat1, lat2])
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = math.sin(d_phi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(d_lambda/2)**2
+    phi1 = math.radians(lat1); phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1); dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
 
-
-def lidar_thread_func(lidar):
-    global latest_scan
-    for scan in lidar.iter_scans():
-        latest_scan = scan
-
-
-def is_front_clear():
-    global latest_scan
-    scan_data = latest_scan
-    if scan_data is None:
-        return True
-    for (_, angle, dist) in scan_data:
-        if (angle >= 340 or angle <= 20) and 0 < dist < MIN_DISTANCE:
-            return False
-    return True
-
-
-def is_left_clear():
-    global latest_scan
-    scan_data = latest_scan
-    if scan_data is None:
-        return True
-    for (_, angle, dist) in scan_data:
-        if (270 <= angle <= 340) and 0 < dist < (MIN_DISTANCE + 100):
-            return False
-    return True
-
-
-def scale_servo_to_speed(servo_value):
-    if servo_value is None:
-        return 0
-    return int((servo_value - 1500) / 500 * 100)
-
-
-def avoid_obstacle():
-    motor_control(0, 0)
-    time.sleep(0.3)
-    while not is_front_clear():
-        print("[OBSTACLE] Avoiding...")
-        motor_control(20, -20)
-        time.sleep(0.5)
-    motor_control(20, 20)
-    time.sleep(1.5)
-
-
-def follow_obstacle():
-    while True:
-        if not is_front_clear():
-            print("[OBSTACLE] Turning right")
-            motor_control(TURN_SPEED, -TURN_SPEED)
-        elif not is_left_clear():
-            print("[OBSTACLE] Moving forward")
-            motor_control(FORWARD_SPEED, FORWARD_SPEED)
-        else:
-            break
-
-
-def goto_position(vehicle, target_location):
-    global latest_servo1_value, latest_servo3_value
-    print(f"[Navigation] Moving to target: {target_location.lat}, {target_location.lon}")
-    vehicle.simple_goto(target_location)
-    while True:
-        current_location = vehicle.location.global_relative_frame
-        dist = get_haversine_distance(current_location.lat, current_location.lon,
-                                      target_location.lat, target_location.lon)
-        print(f"[Navigation] Distance to target: {dist:.2f} m")
-
-        if dist <= WAYPOINT_REACHED_RADIUS:
-            print("[Navigation] Target reached!")
-            break
-
-        if not is_front_clear():
-            print("[Warning] Obstacle ahead!")
-            follow_obstacle()
-
-        s1, s3 = latest_servo1_value, latest_servo3_value
-        motor_control(scale_servo_to_speed(s1), scale_servo_to_speed(s3))
-        time.sleep(0.1)
-
-
-def motor_control(left, right):
-    command_r = {"T": 10010, "id": 2, "cmd": -right, "act": 3}
-    command_l = {"T": 10010, "id": 1, "cmd": left, "act": 3}
-    ddsm_ser.write((json.dumps(command_r) + '\n').encode())
-    time.sleep(0.01)
-    ddsm_ser.write((json.dumps(command_l) + '\n').encode())
-
-
-# =============== ArUco vision thread ===============
-def aruco_thread_func():
-    global latest_tag, aruco_thread_running
-    cap = cv2.VideoCapture(0)
-    print("[Vision] ArUco camera started")
-
-    while aruco_thread_running:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
-
-        if ids is not None:
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, MARKER_LENGTH,
-                                                              CAMERA_MATRIX, DIST_COEFFS)
-            distances = [np.linalg.norm(tvec[0]) for tvec in tvecs]
-            nearest = int(np.argmin(distances))
-            latest_tag = {
-                "id": int(ids[nearest]),
-                "x": tvecs[nearest][0][0],
-                "y": tvecs[nearest][0][1],
-                "z": tvecs[nearest][0][2]
-            }
-            aruco.drawDetectedMarkers(frame, corners)
-            aruco.drawAxis(frame, CAMERA_MATRIX, DIST_COEFFS,
-                           rvecs[nearest], tvecs[nearest], 0.05)
-        else:
-            latest_tag = None
-
-        cv2.imshow("Aruco", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print("[Vision] ArUco stopped")
-
-
-def vision_guided_navigation():
-    """Simple proportional alignment to visible ArUco"""
-    global latest_tag
-    if latest_tag is None:
-        motor_control(0, 0)
-        print("[Vision] No tag visible")
-        return False
-
-    id_ = latest_tag["id"]
-    x, y, z = latest_tag["x"], latest_tag["y"], latest_tag["z"]
-    print(f"[Vision] Tag {id_}: x={x:.2f}, z={z:.2f}")
-
-    if abs(x) > 0.05:
-        if x > 0:
-            motor_control(20, -20)
-        else:
-            motor_control(-20, 20)
-    elif z > 0.4:
-        motor_control(30, 30)
-    else:
-        motor_control(0, 0)
-        print(f"[Vision] Reached tag {id_}")
-        return True
-    return False
-
-
 # =================== MAIN ===================
-
 def main():
-    global latest_scan, path, aruco_thread_running
-    path = read_coordinates_from_file(FILE_NAME)
-    print(f"[System] Coordinates: {path}")
+    global latest_scan, path, aruco_thread_running, latest_servo1_value, latest_servo3_value
 
-    print("[System] Starting LIDAR...")
-    lidar = RPLidar(LIDAR_PORT)
-    threading.Thread(target=lidar_thread_func, args=(lidar,), daemon=True).start()
-    while latest_scan is None:
+    # load path if present (optional)
+    FILE_NAME = "logged_coordinates.txt"
+    path = read_coordinates_from_file(FILE_NAME)
+    print(f"[System] Loaded {len(path)} waypoints.")
+
+    # start lidar thread
+    try:
+        lidar = RPLidar(LIDAR_PORT)
+        threading.Thread(target=lidar_thread_func, args=(lidar,), daemon=True).start()
+    except Exception as e:
+        print(f"[LIDAR] Failed to start: {e}")
+        lidar = None
+
+    # wait for lidar data briefly (not mandatory)
+    wait_count = 0
+    while latest_scan is None and wait_count < 6:
         print("[System] Waiting for LIDAR data...")
         time.sleep(1)
-    print("[System] LIDAR active")
+        wait_count += 1
 
-    # Start ArUco camera thread
+    # start vision thread
     threading.Thread(target=aruco_thread_func, daemon=True).start()
+    time.sleep(0.5)  # allow camera to warm up
 
-    print("[System] Connecting to Pixhawk...")
-    vehicle = connect(PIXHAWK_PORT, baud=BAUDRATE, wait_ready=False)
-    print("[System] Pixhawk connected")
+    # connect to pixhawk
+    try:
+        vehicle = connect(PIXHAWK_PORT, baud=BAUDRATE, wait_ready=False)
+        print("[System] Connected to Pixhawk.")
+    except Exception as e:
+        print(f"[System] Pixhawk connection failed: {e}")
+        vehicle = None
 
-    @vehicle.on_message('SERVO_OUTPUT_RAW')
-    def servo_listener(self, name, msg):
-        global latest_servo1_value, latest_servo3_value
-        latest_servo1_value = msg.servo1_raw
-        latest_servo3_value = msg.servo3_raw
+    # servo listener (if vehicle available)
+    if vehicle:
+        @vehicle.on_message('SERVO_OUTPUT_RAW')
+        def servo_listener(self, name, msg):
+            global latest_servo1_value, latest_servo3_value
+            latest_servo1_value = getattr(msg, 'servo1_raw', None)
+            latest_servo3_value = getattr(msg, 'servo3_raw', None)
 
-    print("[System] Arming vehicle...")
-    vehicle.armed = True
-    while not vehicle.armed:
-        time.sleep(1)
-    print("[System] Vehicle armed")
-
-    print("[System] Setting GUIDED mode...")
-    vehicle.mode = VehicleMode("GUIDED")
-    while vehicle.mode.name != "GUIDED":
-        time.sleep(1)
-    print(f"[System] Mode: {vehicle.mode.name}")
+        # arm and guided mode
+        try:
+            vehicle.armed = True
+            while not vehicle.armed:
+                print("[System] Waiting for arming...")
+                time.sleep(1)
+            vehicle.mode = VehicleMode("GUIDED")
+            while vehicle.mode.name != "GUIDED":
+                print("[System] Waiting for GUIDED mode...")
+                time.sleep(1)
+            print(f"[System] Vehicle mode: {vehicle.mode.name}")
+        except Exception as e:
+            print(f"[System] Vehicle setup error: {e}")
 
     try:
-        # -------- GPS Navigation Phase --------
-        for i, coord in enumerate(path):
-            loc = LocationGlobalRelative(coord[0], coord[1], ALTITUDE)
-            print(f"[System] Waypoint {i+1}")
-            goto_position(vehicle, loc)
-            time.sleep(0.5)
+        # --- optional GPS-phase: drive to last GPS waypoint before vision phase ---
+        if path and vehicle:
+            for i, (lat, lon) in enumerate(path):
+                print(f"[System] Going to waypoint {i+1}/{len(path)}: {lat},{lon}")
+                target = LocationGlobalRelative(lat, lon, ALTITUDE)
+                # simple goto (non-blocking) and monitor distance
+                vehicle.simple_goto(target)
+                while True:
+                    cur = vehicle.location.global_relative_frame
+                    dist = get_haversine_distance(cur.lat, cur.lon, lat, lon)
+                    print(f"[Navigation] distance to waypoint: {dist:.1f} m")
+                    if dist <= WAYPOINT_REACHED_RADIUS:
+                        print("[Navigation] Waypoint reached.")
+                        break
+                    # handle lidar obstacles
+                    if not is_front_clear():
+                        print("[Navigation] LIDAR: obstacle ahead — following obstacle avoidance routine.")
+                        follow_start = time.time()
+                        # simple avoidance: rotate and move until clear
+                        motor_control(TURN_SPEED, -TURN_SPEED)
+                        time.sleep(0.6)
+                        motor_control(FORWARD_SPEED, FORWARD_SPEED)
+                        time.sleep(0.8)
+                        motor_control(0,0)
+                    # also support servo-based teleop fallback if present
+                    if latest_servo1_value is not None:
+                        left = int((latest_servo1_value - 1500) / 500 * 100)
+                        right = int((latest_servo3_value - 1500) / 500 * 100) if latest_servo3_value is not None else left
+                        motor_control(left, right)
+                    time.sleep(0.4)
+                motor_control(0,0)
+                time.sleep(0.5)
 
-        # -------- Vision-Guided Phase --------
-        print("[System] Switching to vision-guided mode...")
-        reached_ramp, reached_top, reached_door = False, False, False
+        # --- Vision guided phase: follow tag sequence ---
+        print("[System] Starting vision-guided phase.")
+        for target_id in TAG_SEQUENCE:
+            print(f"[System] Target tag: {target_id}")
+            reached = False
+            attempts = 0
+            while not reached and attempts < MAX_SEARCH_ATTEMPTS:
+                # 1) If currently visible and correct ID, try to approach
+                if latest_tag is not None and latest_tag["id"] == target_id:
+                    reached = vision_navigate_to_tag(target_id)
+                    if reached:
+                        break
+                    # continue loop, vision_navigate_to_tag will command motors
+                else:
+                    # 2) search by rotating
+                    found = search_for_next_tag(target_id, timeout=SEARCH_TIMEOUT)
+                    if found:
+                        # next loop iteration will approach
+                        continue
+                    # 3) if not found, attempt a short dead-reckon forward maneuver then retry
+                    print(f"[System] Tag {target_id} not found after scan — dead-reckon attempt.")
+                    dead_reckon_forward(DEAD_RECKON_FORWARD_SEC)
+                    attempts += 1
+            if not reached:
+                # final chance: if still not reached, report and continue to next target or abort
+                print(f"[System] Warning: failed to reach tag {target_id} after {MAX_SEARCH_ATTEMPTS} attempts. Continuing.")
+            else:
+                print(f"[System] Reached tag {target_id} successfully.")
+            motor_control(0, 0)
+            time.sleep(0.8)
 
-        while True:
-            if not reached_ramp:
-                reached_ramp = vision_guided_navigation()
-                if reached_ramp:
-                    print("[System] ✅ Reached ramp entrance (Tag 1)")
-                    time.sleep(1)
-
-            elif not reached_top:
-                reached_top = vision_guided_navigation()
-                if reached_top:
-                    print("[System] ✅ Reached top of ramp (Tag 2)")
-                    time.sleep(1)
-
-            elif not reached_door:
-                reached_door = vision_guided_navigation()
-                if reached_door:
-                    print("[System] 🎯 Reached door (Tag 3)")
-                    break
+        print("[System] Vision phase complete. Stopping.")
+        motor_control(0, 0)
+        time.sleep(0.5)
 
     except KeyboardInterrupt:
-        print("[System] Keyboard interrupt")
+        print("[System] KeyboardInterrupt — stopping.")
         motor_control(0, 0)
 
     finally:
+        # Shutdown / cleanup
+        print("[System] Cleaning up...")
         aruco_thread_running = False
         motor_control(0, 0)
-        vehicle.close()
-        lidar.stop()
-        lidar.stop_motor()
-        lidar.disconnect()
-        ddsm_ser.close()
-        print("[System] Shutdown complete")
+        try:
+            if vehicle:
+                vehicle.close()
+        except Exception:
+            pass
+        try:
+            if lidar:
+                lidar.stop()
+                lidar.stop_motor()
+                lidar.disconnect()
+        except Exception:
+            pass
+        try:
+            if ddsm_ser:
+                ddsm_ser.close()
+        except Exception:
+            pass
+        print("[System] Shutdown complete.")
 
-# =================== RUN ===================
 if __name__ == "__main__":
     main()
+
 
