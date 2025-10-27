@@ -156,7 +156,7 @@ def aruco_thread_func(vstream=VIDEO_STREAM_URL):
     print("[Vision] Camera thread exiting.")
 
 # =================== VISION HELPERS ===================
-def vision_navigate_to_tag(target_id, align_thresh_x=0.05, stop_dist=0.4):
+def vision_navigate_to_tag(target_id, align_thresh_x=0.05, stop_dist=1):
     """
     Move robot toward a *specific* target tag ID using latest_tag data.
     Returns True when reached (z <= stop_dist).
